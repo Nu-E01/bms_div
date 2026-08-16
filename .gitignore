@@ -17,6 +17,12 @@ Thumbs.db
 .idea/
 .vscode/
 
+# PyInstaller / release build artifacts
+build/
+dist/
+spec/
+*.spec
+
 # generated outputs kept alongside BMS files
 *.rpp
 *.bms

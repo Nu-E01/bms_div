@@ -12,7 +12,7 @@ from pathlib import Path
 
 LANGUAGES = {
     "zh": {
-        "title": "BMS_div 1.0",
+        "title": "BMS_div",
         "select_file": "选择BMS文件",
         "not_selected": "未选择文件",
         "ready": "就绪",
@@ -59,7 +59,7 @@ LANGUAGES = {
         "import_group_title": "导入分组配置",
     },
     "ja": {
-        "title": "BMS_div 1.0",
+        "title": "BMS_div",
         "select_file": "BMSファイルを選択",
         "not_selected": "ファイル未選択",
         "ready": "準備完了",
@@ -106,7 +106,7 @@ LANGUAGES = {
         "import_group_title": "グループ設定を読み込み",
     },
     "en": {
-        "title": "BMS_div 1.0",
+        "title": "BMS_div",
         "select_file": "Select BMS file",
         "not_selected": "No file selected",
         "ready": "Ready",
@@ -155,27 +155,35 @@ LANGUAGES = {
 }
 
 def detect_system_language():
-    default_locale = ""
+    candidate_strings = []
+
     try:
-        default_locale = locale.getlocale()[0] or ""
+        current_locale = locale.getlocale()[0]
     except Exception:
-        default_locale = ""
+        current_locale = None
+    if current_locale:
+        candidate_strings.append(current_locale)
 
-    if not default_locale:
-        try:
-            default_locale = locale.setlocale(locale.LC_ALL, "") or ""
-        except Exception:
-            default_locale = ""
+    try:
+        locale_name = locale.setlocale(locale.LC_ALL, "")
+        if locale_name:
+            candidate_strings.append(locale_name)
+    except Exception:
+        pass
 
-    if not default_locale:
-        return "en"
+    for candidate in candidate_strings:
+        value = str(candidate).lower().replace("-", "_")
+        if "zh" in value or "china" in value or "chinese" in value:
+            return "zh"
+        if "ja" in value or "japan" in value or "japanese" in value:
+            return "ja"
 
-    normalized = default_locale.lower().replace("-", "_")
-    normalized = normalized.split("_", 1)[0]
-    if normalized.startswith("zh"):
-        return "zh"
-    if normalized.startswith("ja"):
-        return "ja"
+        normalized = value.split("_", 1)[0]
+        if normalized.startswith("zh"):
+            return "zh"
+        if normalized.startswith("ja"):
+            return "ja"
+
     return "en"
 
 
@@ -1583,7 +1591,7 @@ def build_cli_parser():
         help="Export format. Results are written next to the source BMS file in the same directory.",
     )
     parser.add_argument("--lang", choices=("zh", "ja", "en"), default=os.getenv("BMS_DIV_LANG", detect_system_language()), help="Language for CLI/help text")
-    parser.add_argument("--version", action="version", version="BMS_div 1.0")
+    parser.add_argument("--version", action="version", version="BMS_div")
     return parser
 
 
