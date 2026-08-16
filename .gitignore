@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.bak
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db
+
+# GUI/editor artifacts
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# generated outputs kept alongside BMS files
+*.rpp
+*.bms
+*.json
