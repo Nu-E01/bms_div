@@ -19,6 +19,7 @@ LANGUAGES = {
         "waiting": "加载中...",
         "loading_audio": "预加载音频中...",
         "load_success": "成功加载",
+        "auto_group_stats": "自动分组 {} 组（覆盖 {}/{}，最大组 {}）",
         "initial_bpm": "初始BPM={}",
         "pending_group": "待分组",
         "groups": "分组",
@@ -36,6 +37,7 @@ LANGUAGES = {
         "group_import_fail": "分组导入失败",
         "bms_export_done": "BMS 导出完毕",
         "rpp_export_done": "RPP 导出完毕：{}",
+        "length_skipped": "{} 个音源无法读取真实时长，已跳过",
         "group_export_ok": "分组导出成功",
         "group_import_ok": "导入完成：共 {} 个分组",
         "group_import_failed": "导入失败：{}",
@@ -66,6 +68,7 @@ LANGUAGES = {
         "waiting": "読み込み中...",
         "loading_audio": "音声を事前読み込み中...",
         "load_success": "読み込み成功",
+        "auto_group_stats": "自動グループ {} 件（カバー {}/{}、最大 {}）",
         "initial_bpm": "初期BPM={}",
         "pending_group": "未分類",
         "groups": "グループ",
@@ -83,6 +86,7 @@ LANGUAGES = {
         "group_import_fail": "グループ設定の読み込みに失敗しました",
         "bms_export_done": "BMSの出力が完了しました",
         "rpp_export_done": "RPPの出力が完了しました：{}",
+        "length_skipped": "{} 件の音源の長さを取得できず、スキップしました",
         "group_export_ok": "グループ設定の出力に成功しました",
         "group_import_ok": "読み込み完了：グループ数 {}",
         "group_import_failed": "読み込み失敗：{}",
@@ -113,6 +117,7 @@ LANGUAGES = {
         "waiting": "Loading...",
         "loading_audio": "Preloading audio...",
         "load_success": "Loaded successfully",
+        "auto_group_stats": "Auto-grouped {} groups (covers {}/{}, largest {})",
         "initial_bpm": "Initial BPM={}",
         "pending_group": "Unsorted",
         "groups": "Groups",
@@ -130,6 +135,7 @@ LANGUAGES = {
         "group_import_fail": "Group config import failed",
         "bms_export_done": "BMS export complete",
         "rpp_export_done": "RPP export complete: {}",
+        "length_skipped": "Skipped {} sound(s) whose real length could not be read",
         "group_export_ok": "Group config export successful",
         "group_import_ok": "Import complete: {} groups",
         "group_import_failed": "Import failed: {}",
@@ -461,6 +467,76 @@ def sanitize_filename(name):
     return re.sub(r'[\\/:*?"<>|]', '_', name)
 
 
+# Keysound file names in the wild fall into a handful of shapes. The rules below
+# are tried in order; the first one that yields a usable family wins, and when
+# none does the keysound deliberately stays ungrouped. Over-grouping is worse
+# than under-grouping: a wrong bucket hides sounds, an ungrouped sound is just
+# one more track the user can group by hand.
+#
+#   1. parameterised tail        b_05_v100l4-9o6c      -> b_05
+#   2. leading words, stop at a  voice_001 / Vox_0001  -> voice / Vox
+#      pure-number segment       _mh_bubble_000        -> mh_bubble
+#   3. trailing serial number    bass01 / ar001       -> bass / ar
+#      inside the last segment
+#   4. give up                  01 / 0A / 4 002       -> None (ungrouped)
+#   5. safety valve              family must be >= 2 characters and contain a
+#      letter, which is what stops the old "everything becomes b" collapse.
+RE_KEYSOUND_VARIANT_TAIL = re.compile(r'_[vlo]\d', re.IGNORECASE)
+RE_TRAILING_DIGITS = re.compile(r'\d+$')
+
+
+def keysound_family_key(stem):
+    """Return the instrument family a keysound file name belongs to.
+
+    ``b_05_v100l4-9o6c`` -> ``b_05`` (MID2BMS-style parameterised export)
+    ``voice_001`` -> ``voice``
+    ``bass01`` -> ``bass``
+    ``p - LookAtMe ToKS Lead Voc Marked_2 #3_4`` -> ``p_LookAtMe_ToKS_Lead_Voc_Marked``
+    ``y_end_01_ZP-b84974df`` -> ``y_end``
+    ``01`` / ``0A`` / ``4 002`` -> None
+
+    Returns None when no meaningful family can be derived, so the caller leaves
+    the keysound ungrouped instead of dropping it into a catch-all bucket.
+    """
+    if not stem:
+        return None
+
+    tail = RE_KEYSOUND_VARIANT_TAIL.search(stem)
+    if tail:
+        # Rule 1. Everything from the variant parameters on is a rendering of the
+        # same sample, so cut there. The number inside the family (b_05) is part
+        # of the instrument identity and must survive.
+        family = stem[:tail.start()].strip()
+    else:
+        # Rule 2. Normalise separators (spaces, dashes, brackets) to "_" and keep
+        # the leading words, stopping at the first pure-number segment: that is a
+        # take or serial index, not part of the family.
+        normalised = re.sub(r'[^0-9A-Za-z]+', '_', stem).strip('_')
+        kept = []
+        for part in normalised.split('_'):
+            if part.isdigit() and kept:
+                break
+            if part:
+                kept.append(part)
+
+        # Rule 3. A serial number glued to the last word (bass01, ar001, Crash2)
+        # belongs to the variant, not the family. Only strip it when a usable
+        # word remains, so "F00" is left alone rather than becoming "F".
+        if kept:
+            stripped = RE_TRAILING_DIGITS.sub('', kept[-1])
+            if len(stripped) >= 2 and any(ch.isalpha() for ch in stripped):
+                kept[-1] = stripped
+        family = '_'.join(kept)
+
+    family = family.strip(' _-#')
+    # Rule 5. A single character (the old code produced "b" for every b_NN
+    # sample) or a digit-only stub is not a usable group name: leave the
+    # keysound ungrouped instead of creating a catch-all.
+    if len(family) < 2 or not any(ch.isalpha() for ch in family):
+        return None
+    return family
+
+
 def get_adjusted_track_data(original_data, valid_ids):
     result = []
     for i in range(0, len(original_data), 2):
@@ -523,6 +599,136 @@ def _update_data(old_data, new_data):
         else:
             merged_data[i] = new_data_value
     return merged_data
+
+
+def _probe_riff_wave_length(file_obj):
+    """Read the true duration out of a RIFF/RF64 WAVE header.
+
+    The stdlib ``wave`` module refuses 24-bit / 32-bit float /
+    WAVE_FORMAT_EXTENSIBLE files, which this header walk handles, and it falls
+    back to the physical file size when the data chunk carries a placeholder
+    size (streamed or interrupted recordings).
+    """
+    header = file_obj.read(12)
+    if len(header) < 12 or header[:4] not in (b"RIFF", b"RIFX", b"RF64") or header[8:12] != b"WAVE":
+        return None
+
+    file_obj.seek(0, os.SEEK_END)
+    file_size = file_obj.tell()
+    order = "big" if header[:4] == b"RIFX" else "little"
+
+    sample_rate = 0
+    block_align = 0
+    data_size = None
+    pos = 12
+    while pos + 8 <= file_size:
+        file_obj.seek(pos)
+        chunk_header = file_obj.read(8)
+        if len(chunk_header) < 8:
+            break
+        chunk_id = chunk_header[:4]
+        chunk_size = int.from_bytes(chunk_header[4:8], order)
+        body = pos + 8
+        if chunk_id == b"fmt ":
+            fmt = file_obj.read(min(chunk_size, 64))
+            if len(fmt) >= 16:
+                channels = int.from_bytes(fmt[2:4], order)
+                sample_rate = int.from_bytes(fmt[4:8], order)
+                block_align = int.from_bytes(fmt[12:14], order)
+                bits = int.from_bytes(fmt[14:16], order)
+                if block_align <= 0 and channels > 0 and bits > 0:
+                    block_align = channels * ((bits + 7) // 8)
+        elif chunk_id == b"data":
+            data_size = chunk_size
+            if data_size in (0, 0xFFFFFFFF):
+                data_size = file_size - body
+            break
+        pos = body + chunk_size + (chunk_size & 1)
+
+    if not sample_rate or block_align <= 0 or not data_size or data_size <= 0:
+        return None
+    frames = data_size // block_align
+    if frames <= 0:
+        return None
+    return frames / float(sample_rate)
+
+
+def probe_audio_length(audio_path):
+    """Return ``(duration_seconds, source)`` for an audio file, or ``(None, None)``.
+
+    Attempts, in order of accuracy:
+      1. RIFF/WAVE header walk - exact, and covers 24-bit / EXTENSIBLE / float
+         WAV files the stdlib ``wave`` module rejects;
+      2. mutagen - ogg / mp3 / flac / m4a and anything else it recognises;
+      3. pydub - only when the optional dependency happens to be installed.
+
+    Never invents a duration. A caller that gets ``None`` must warn and skip the
+    keysound instead of substituting a placeholder length, because a made-up
+    length is exactly what truncates the item in REAPER.
+    """
+    try:
+        with open(audio_path, "rb") as file_obj:
+            duration = _probe_riff_wave_length(file_obj)
+        if duration and duration > 0:
+            return duration, "riff"
+    except Exception:
+        pass
+
+    try:
+        import mutagen
+        audio = mutagen.File(audio_path)
+        duration = getattr(getattr(audio, "info", None), "length", None)
+        if duration and duration > 0:
+            return float(duration), "mutagen"
+    except Exception:
+        pass
+
+    try:
+        from pydub import AudioSegment
+        segment = AudioSegment.from_file(audio_path)
+        if segment.frame_rate:
+            return segment.frame_count() / float(segment.frame_rate), "pydub"
+    except Exception:
+        pass
+
+    return None, None
+
+
+def _same_sound_key(wav_path):
+    """Group identity for "the same sound": the audio file, not the WAV id."""
+    return os.path.normcase(os.path.abspath(str(wav_path)))
+
+
+def apply_same_sound_trim(sample_dict, wav_id_to_path):
+    """Cut each sample where the same sound is triggered again.
+
+    Truncation priority is ``same sound replay > the audio's own true length``:
+    an item only ever becomes shorter than the source file when that exact
+    audio file is triggered again before it finishes. Nothing else shortens it.
+
+    Occurrences are grouped by resolved audio file rather than by WAV id, so two
+    ids pointing at one file behave the same as one id pointing at it twice.
+
+    Long-note tails are excluded: a tail is the "release" marker of a hold, not a
+    fresh trigger of the sound, so it must not shorten the head's audio.
+    """
+    groups = {}
+    for wav_id, samples in sample_dict.items():
+        wav_path = wav_id_to_path.get(wav_id)
+        key = _same_sound_key(wav_path) if wav_path else wav_id
+        bucket = groups.setdefault(key, [])
+        for sample in samples:
+            if sample.get("ln_tail"):
+                continue
+            bucket.append(sample)
+
+    for samples in groups.values():
+        samples.sort(key=lambda sample: sample["pos"])
+        for index in range(len(samples) - 1):
+            current = samples[index]
+            following = samples[index + 1]
+            if current["pos"] + current["length"] > following["pos"]:
+                current["length"] = following["pos"] - current["pos"]
 
 
 def compute_bms_timeline(bms_lines, wav_id_to_path):
@@ -619,31 +825,21 @@ def compute_bms_timeline(bms_lines, wav_id_to_path):
     max_measure += 1
 
     keysound_lengths = {}
-    import wave as _wave
-    mutagen_available = False
-    try:
-        import mutagen
-        mutagen_available = True
-    except ImportError:
-        pass
+    length_warnings = []
     for wav_id, wav_path in wav_id_to_path.items():
-        ext = Path(wav_path).suffix.lower()
-        try:
-            if ext == '.wav':
-                with _wave.open(wav_path, 'r') as wf:
-                    keysound_lengths[wav_id] = wf.getnframes() / float(wf.getframerate())
-            elif mutagen_available:
-                keysound_lengths[wav_id] = mutagen.File(wav_path).info.length
-            else:
-                keysound_lengths[wav_id] = 1.0
-        except Exception:
-            keysound_lengths[wav_id] = 1.0
+        if not wav_path or not Path(wav_path).is_file():
+            length_warnings.append(f"{wav_id}: {wav_path} (文件不存在)")
+            continue
+        duration, _source = probe_audio_length(wav_path)
+        if not duration:
+            length_warnings.append(f"{wav_id}: {wav_path} (无法读取音频时长)")
+            continue
+        keysound_lengths[wav_id] = duration
 
     sample_dict = {}
     channelsample_dict = {}
     current_timepos = 0.0
     current_bpmpos_i = 0
-    active_long_notes = {}
 
     def measure_offset_seconds(start_measure, beatpos, bpmpos_array, stop_positions, measure_len):
         bpmpos = bpmpos_array[0]
@@ -776,22 +972,33 @@ def compute_bms_timeline(bms_lines, wav_id_to_path):
 
         current_bpmpos_i += (bpms_in_measure - 1)
 
+    # Long-note channels (51-59 / 61-69).
+    #
+    # LNTYPE 1 writes a long note as a pair of notes carrying the SAME keysound:
+    # the head starts the sample and the tail marks where the hold is released.
+    # The tail is a marker, not a fresh trigger:
+    #   * it does not retrigger the sound itself (length 0 -> dropped), and
+    #   * it must not cut the head's audio short, so the head keeps the file's
+    #     real length and is trimmed only by a genuine replay of that sound.
+    #
+    # When the neighbouring note carries a DIFFERENT keysound this channel is
+    # simply being used as an ordinary note channel, and nothing may be trimmed.
     for channel in channelsample_dict:
+        if channel not in LONG_NOTE_CHANNELS:
+            continue
         sample_array = channelsample_dict[channel]
         sample_array.sort(key=lambda s: s["pos"])
-        for s in range(len(sample_array)):
-            sample = sample_array[s]
-            if channel in LONG_NOTE_CHANNELS:
-                if channel not in active_long_notes:
-                    active_long_notes[channel] = sample["index"]
-                    if s + 1 < len(sample_array):
-                        next_sample = sample_array[s + 1]
-                        if sample["pos"] + sample["length"] > next_sample["pos"]:
-                            sample["length"] = next_sample["pos"] - sample["pos"]
-                else:
-                    if sample["index"] == active_long_notes[channel]:
-                        sample["length"] = 0
-                    del active_long_notes[channel]
+        pending_start = None
+        for sample in sample_array:
+            if pending_start is not None and sample["index"] == pending_start["index"]:
+                sample["ln_tail"] = True
+                sample["length"] = 0
+                pending_start = None
+            else:
+                pending_start = sample
+
+    # Truncation priority: same sound replay > the audio's own true length.
+    apply_same_sound_trim(sample_dict, wav_id_to_path)
 
     tempoenv_lines = []
     if bpm_positions or len(measurelentime_dict) > 1:
@@ -809,7 +1016,7 @@ def compute_bms_timeline(bms_lines, wav_id_to_path):
             if ts_num <= 256 and ts_den <= 256:
                 tempoenv_lines.append(f'    PT {measurelentime} 0 1 {ts_den * 65536 + ts_num} 0 3\n')
 
-    return sample_dict, chart_bpm, tempoenv_lines, master_volume
+    return sample_dict, chart_bpm, tempoenv_lines, master_volume, length_warnings
 
 
 def write_sub_bms(lines, group_wavs, group_name, target_dir, encoding):
@@ -831,6 +1038,8 @@ class BMSController:
         self.initial_bpm = ""
         self.group_manager = None
         self.encoding = 'utf-8'
+        self.last_length_warnings = []
+        self.auto_group_stats = {}
 
     def load_bms_file(self, file_path_str):
         self.file_path = Path(file_path_str)
@@ -861,46 +1070,48 @@ class BMSController:
         self.group_manager = GroupManager(resolved_map, self.wav_id_order)
 
         if self.wav_id_to_path and all(re.fullmatch(r'[0-9A-Z]{2}', Path(resolved_map[wid]).stem, flags=re.IGNORECASE) for wid in self.wav_id_order):
+            # Every keysound is named after its two-character index: there is no
+            # family information to group by, so leave everything pending.
+            self.refresh_auto_group_stats()
             return
 
         try:
             prefix_map = {}
 
-            def candidate_key_from_stem(stem):
-                left = re.split(r'(_v\d+|_l\d+|_o\d+|_#\d+|_\d+$)', stem, flags=re.IGNORECASE)[0]
-                if not left:
-                    return None
-                left = left.strip()
-                if not left:
-                    return None
-                while True:
-                    m = re.search(r'[-_]\s*\d+\s*$', left)
-                    if m:
-                        left = left[:m.start()].strip()
-                    else:
-                        break
-                if left and any(ch.isalpha() for ch in left):
-                    return left
-                return None
-
             for wid in self.wav_id_order:
                 if wid not in resolved_map:
                     continue
                 stem = Path(resolved_map[wid]).stem
-                key = candidate_key_from_stem(stem)
+                key = keysound_family_key(stem)
                 if key:
                     prefix_map.setdefault(key, []).append(wid)
 
-            created_any = False
-            for prefix, ids in prefix_map.items():
-                if len(ids) >= 2:
-                    self.group_manager.save_state_to_history()
+            # One snapshot for the whole auto-grouping pass, so a single Ctrl+Z
+            # puts every keysound back into the pending list again.
+            pending = [(prefix, ids) for prefix, ids in prefix_map.items() if len(ids) >= 2]
+            if pending:
+                self.group_manager.save_state_to_history()
+                for prefix, ids in pending:
                     self.group_manager.move_ids_to_target_group(ids, prefix)
-                    created_any = True
-            if created_any:
                 self.group_manager.redo_stack = []
         except Exception:
             pass
+
+        self.refresh_auto_group_stats()
+
+    def refresh_auto_group_stats(self):
+        """Record how well the automatic grouping did, for the UI/CLI to report."""
+        groups = self.group_manager.groups if self.group_manager else {}
+        total = len(self.wav_id_order)
+        grouped = sum(len(members) for members in groups.values())
+        self.auto_group_stats = {
+            "groups": len(groups),
+            "grouped": grouped,
+            "total": total,
+            "largest": max((len(members) for members in groups.values()), default=0),
+            "coverage": (100.0 * grouped / total) if total else 0.0,
+        }
+        return self.auto_group_stats
 
     def generate_group_bms_files(self):
         if not self.group_manager:
@@ -914,7 +1125,14 @@ class BMSController:
         if not self.file_path:
             raise ValueError("No BMS file loaded; cannot export RPP")
 
-        sample_dict, chart_bpm, tempoenv_lines, master_volume = compute_bms_timeline(self.bms_lines, self.group_manager.original_wav_map)
+        sample_dict, chart_bpm, tempoenv_lines, master_volume, length_warnings = compute_bms_timeline(self.bms_lines, self.group_manager.original_wav_map)
+        self.last_length_warnings = length_warnings
+        for warning in length_warnings:
+            if sys.stderr is not None:
+                try:
+                    print(f"[BMS_div] 跳过无法计时长的音源 - {warning}", file=sys.stderr)
+                except Exception:
+                    pass
 
         out_rpp_path = self.file_path.with_suffix('.rpp')
         with open(out_rpp_path, 'w', encoding='utf-8') as rpp_out:
@@ -935,12 +1153,9 @@ class BMSController:
                 wav_ext = Path(wav_path).suffix.lower()
                 sample_array = sample_dict[ki]
                 sample_array.sort(key=lambda s: s["pos"])
-                for s in range(len(sample_array)):
-                    sample = sample_array[s]
-                    if s + 1 < len(sample_array):
-                        next_sample = sample_array[s + 1]
-                        if sample["pos"] + sample["length"] > next_sample["pos"]:
-                            sample["length"] = next_sample["pos"] - sample["pos"]
+                for sample in sample_array:
+                    # LENGTH was already decided in compute_bms_timeline:
+                    # same sound replay > the audio's own true length.
                     if sample["length"] > 0:
                         rpp_out.write("<ITEM\n")
                         rpp_out.write("POSITION {}\n".format(sample["pos"]))
@@ -1138,7 +1353,12 @@ class BMSDivGUI:
             else:
                 self.label_bpm_info.config(text="")
             self._ui_refresh_all()
-            self.label_status.config(text=f"{gettext('load_success')} (编码: {self.controller.encoding})")
+            status = f"{gettext('load_success')} (编码: {self.controller.encoding})"
+            stats = getattr(self.controller, "auto_group_stats", None)
+            if stats and stats.get("groups"):
+                status += " · " + gettext("auto_group_stats").format(
+                    stats["groups"], stats["grouped"], stats["total"], stats["largest"])
+            self.label_status.config(text=status)
         except Exception as e:
             self.label_file_info.config(text=gettext("load_failed"), fg="red")
             self.label_bpm_info.config(text="")
@@ -1536,7 +1756,13 @@ class BMSDivGUI:
             self.label_status.config(text=gettext("loading_timeline"))
             self.root.update()
             rpp_path = self.controller.generate_rpp_file()
-            self.label_status.config(text=gettext("rpp_export_done").format(Path(rpp_path).name))
+            skipped = len(getattr(self.controller, "last_length_warnings", []) or [])
+            if skipped:
+                message = gettext("length_skipped").format(skipped)
+                self.label_status.config(text=f"{gettext('rpp_export_done').format(Path(rpp_path).name)} / {message}")
+                messagebox.showwarning(gettext("title"), message)
+            else:
+                self.label_status.config(text=gettext("rpp_export_done").format(Path(rpp_path).name))
             try:
                 os.startfile(self.controller.directory)
             except Exception:
@@ -1640,6 +1866,9 @@ def run_cli(argv=None):
     print(f"Encoding: {controller.encoding}")
     if controller.group_manager:
         print(f"WAV count: {len(controller.wav_id_order)}")
+        stats = controller.auto_group_stats
+        if stats:
+            print("Auto groups: {groups} (covers {grouped}/{total}, largest {largest}, {coverage:.1f}%)".format(**stats))
         print(f"Groups: {len(controller.group_manager.groups)}")
     return 0
 
