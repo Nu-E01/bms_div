@@ -23,6 +23,7 @@ BMS_div 是一款用于整理 BMS 谱面的轻量工具，可根据按键音名�
 - 导出分组后的 BMS 文件
 - 导出 REAPER `.rpp` 工程
 - 导出 / 导入分组配置为 JSON
+- 由 Mid2BMS 命名的键音还原 MIDI：RPP 可附带 MIDI 轨，也可单独导出 `.mid`
 - 通过语言切换支持简体中文、日文和英文
 
 ### 系统要求
@@ -73,6 +74,41 @@ python bms_div.py path/to/chart.bms path/to/groups.json -o bms
 ```bash
 python bms_div.py path/to/chart.bms path/to/groups.json -o rpp
 ```
+
+#### 导出 RPP 并附带 MIDI 轨
+
+```bash
+python bms_div.py path/to/chart.bms path/to/groups.json -o rpp --midi
+```
+
+每个分组后面会多出一条 `<组名> (MIDI)` 并列轨，内含一个 MIDI item。
+
+#### 单独导出 `.mid`
+
+```bash
+python bms_div.py path/to/chart.bms path/to/groups.json -o mid
+```
+
+输出一个 SMF Type 1 文件，一个分组一条 MIDI 轨，适合不用 REAPER 的场合。
+
+#### 给已有工程补 MIDI 轨（无需 REAPER）
+
+```bash
+python bms_div.py --rpp2midi path/to/project.rpp --out path/to/project_midi.rpp
+```
+
+#### MIDI 功能的前提
+
+只有 **Mid2BMS 命名** 的键音才能还原 MIDI，即文件名形如：
+
+```
+<mode>_<Track>_v<Vel>[l<Den>[-<Num>]]o<Oct><Note>    例：b_07_v77l16o2ap
+```
+
+`mode` 为 `b_`/`r_`/`p_`，`o5c` = MIDI 60，时值 = `4*Num/Den` 个四分音符。
+不符合该命名的键音无法还原音高，会被跳过；若整份谱面都没有可识别的键音，
+GUI 的「RPP 附带 MIDI 轨」复选框与「导出 .mid」按钮都会置灰，
+名称里没有 `l<Den>` 的 one-shot 同样跳过（不拿音频长度猜时值）。
 
 #### 指定语言
 
@@ -158,6 +194,40 @@ python bms_div.py path/to/chart.bms path/to/groups.json -o bms
 python bms_div.py path/to/chart.bms path/to/groups.json -o rpp
 ```
 
+#### RPP に MIDI トラックも含める
+
+```bash
+python bms_div.py path/to/chart.bms path/to/groups.json -o rpp --midi
+```
+
+各グループの後ろに `<グループ名> (MIDI)` の並列トラックが追加されます。
+
+#### `.mid` のみ出力
+
+```bash
+python bms_div.py path/to/chart.bms path/to/groups.json -o mid
+```
+
+SMF Type 1（1 グループ = 1 トラック）で出力します。REAPER を使わない場合に便利です。
+
+#### 既存の RPP に MIDI トラックを追加（REAPER 不要）
+
+```bash
+python bms_div.py --rpp2midi path/to/project.rpp --out path/to/project_midi.rpp
+```
+
+#### MIDI 化の前提
+
+MIDI に変換できるのは **Mid2BMS 形式のキー音名** だけです：
+
+```
+<mode>_<Track>_v<Vel>[l<Den>[-<Num>]]o<Oct><Note>    例：b_07_v77l16o2ap
+```
+
+`o5c` = MIDI 60、音価は `4*Num/Den` 四分音符。形式に合わないキー音はスキップされ、
+譜面全体に該当がなければ GUI のチェックボックスと `.mid` ボタンは無効になります。
+`l<Den>` のない one-shot もスキップされます（音声長で代用しません）。
+
 #### 言語指定
 
 ```bash
@@ -190,6 +260,7 @@ BMS_div is a lightweight tool for organizing BMS charts. Users can group notes b
 - Export grouped BMS files
 - Export REAPER `.rpp` project files
 - Import and export group configuration as JSON
+- Rebuild MIDI from Mid2BMS keysound names: optional MIDI tracks in the RPP, or a standalone `.mid`
 - Support Chinese, Japanese, and English via built-in language switching
 
 ### Requirements
@@ -241,6 +312,41 @@ python bms_div.py path/to/chart.bms path/to/groups.json -o bms
 ```bash
 python bms_div.py path/to/chart.bms path/to/groups.json -o rpp
 ```
+
+#### Export RPP with MIDI tracks
+
+```bash
+python bms_div.py path/to/chart.bms path/to/groups.json -o rpp --midi
+```
+
+Adds a `<group> (MIDI)` track after every folder.
+
+#### Export a standalone `.mid`
+
+```bash
+python bms_div.py path/to/chart.bms path/to/groups.json -o mid
+```
+
+One SMF type-1 file, one track per group -- useful when REAPER is not involved.
+
+#### Add MIDI tracks to an existing RPP (no REAPER needed)
+
+```bash
+python bms_div.py --rpp2midi path/to/project.rpp --out path/to/project_midi.rpp
+```
+
+#### What MIDI conversion needs
+
+Only keysounds named the Mid2BMS way carry a pitch:
+
+```
+<mode>_<Track>_v<Vel>[l<Den>[-<Num>]]o<Oct><Note>    e.g. b_07_v77l16o2ap
+```
+
+`o5c` is MIDI 60 and the length is `4*Num/Den` quarter notes. Keysounds that do
+not follow this convention are skipped; when a chart has none, the GUI checkbox
+and the `.mid` button are disabled. One-shots (no `l<Den>`) are skipped too
+rather than borrowing the audio item length.
 
 #### Set locale explicitly
 

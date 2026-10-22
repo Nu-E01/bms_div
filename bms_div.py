@@ -1,4 +1,5 @@
 import re
+import io
 import os
 import json
 import math
@@ -20,6 +21,15 @@ LANGUAGES = {
         "loading_audio": "预加载音频中...",
         "load_success": "成功加载",
         "auto_group_stats": "自动分组 {} 组（覆盖 {}/{}，最大组 {}）",
+        "auto_group_stats_short": "自动分组 {} 组（最大 {}）",
+        "midi_available_hint": "可转 MIDI：{} 个音源/共 {}（one-shot 跳过 {}）",
+        "midi_unavailable_hint": "本谱面无 Mid2BMS 命名的键音，MIDI 功能不可用",
+        "export_rpp_with_midi": "RPP 附带 MIDI 轨",
+        "export_midi": "导出 .mid",
+        "midi_export_done": "已导出 {}",
+        "midi_tracks_written": "MIDI 轨 {} 条 / {} 音",
+        "midi_fail": "MIDI 导出失败",
+        "export_needs_groups": "请先建立至少一个分组，再导出。",
         "initial_bpm": "初始BPM={}",
         "pending_group": "待分组",
         "groups": "分组",
@@ -69,6 +79,15 @@ LANGUAGES = {
         "loading_audio": "音声を事前読み込み中...",
         "load_success": "読み込み成功",
         "auto_group_stats": "自動グループ {} 件（カバー {}/{}、最大 {}）",
+        "auto_group_stats_short": "自動グループ {} 件（最大 {}）",
+        "midi_available_hint": "MIDI 変換可能：{} / {} 音源（one-shot {} 件はスキップ）",
+        "midi_unavailable_hint": "Mid2BMS 形式のキー音名がないため MIDI 機能は使えません",
+        "export_rpp_with_midi": "RPP に MIDI トラックを含める",
+        "export_midi": ".mid を出力",
+        "midi_export_done": "{} を出力しました",
+        "midi_tracks_written": "MIDI トラック {} 件 / {} 音",
+        "midi_fail": "MIDI の出力に失敗しました",
+        "export_needs_groups": "出力する前にグループを1つ以上作成してください。",
         "initial_bpm": "初期BPM={}",
         "pending_group": "未分類",
         "groups": "グループ",
@@ -118,6 +137,15 @@ LANGUAGES = {
         "loading_audio": "Preloading audio...",
         "load_success": "Loaded successfully",
         "auto_group_stats": "Auto-grouped {} groups (covers {}/{}, largest {})",
+        "auto_group_stats_short": "auto-grouped {} (largest {})",
+        "midi_available_hint": "MIDI: {} of {} keysounds convertible ({} one-shot skipped)",
+        "midi_unavailable_hint": "No Mid2BMS-style keysound names, MIDI export unavailable",
+        "export_rpp_with_midi": "RPP with MIDI tracks",
+        "export_midi": "Export .mid",
+        "midi_export_done": "Wrote {}",
+        "midi_tracks_written": "{} MIDI track(s), {} notes",
+        "midi_fail": "MIDI export failed",
+        "export_needs_groups": "Create at least one group before exporting.",
         "initial_bpm": "Initial BPM={}",
         "pending_group": "Unsorted",
         "groups": "Groups",
@@ -267,7 +295,6 @@ class GroupManager:
     """Manage BMS keysound grouping logic and undo/redo history."""
 
     def __init__(self, wav_id_to_path=None, wav_id_order=None):
-        self.label_bpm_info = None
         self.wav_id_order = wav_id_order or []
         self.original_wav_map = {}
         self.remaining_wav_map = {}
@@ -731,6 +758,218 @@ def apply_same_sound_trim(sample_dict, wav_id_to_path):
                 current["length"] = following["pos"] - current["pos"]
 
 
+# ------------------------- Mid2BMS keysound names -> MIDI -------------------------
+#
+# Keysounds produced by Mid2BMS (and compatible exporters) encode the original
+# MIDI note in the file name:
+#
+#     <mode>_<Track>_v<Vel> [ l<Den> [-<Num>] ] o<Oct><Note>
+#
+#   mode  b_ / r_ / p_   (blue / red / purple lane)
+#   Track 07             original MIDI track
+#   v100                 MIDI velocity
+#   l16 / l16-3          note length as Num/Den of a whole note (default Num=1)
+#   o5c                  MIDI pitch = Oct*12 + semitone        (o5c = 60)
+#   Note                 c cp d dp e f fp g gp a ap b          (p = sharp)
+#
+# A name without the l<Den> part is a one-shot: its length is unknown, and the
+# audio item's LENGTH cannot stand in for it (that is the audio duration, and it
+# is trimmed by same-sound replays). One-shots are skipped rather than guessed.
+MID2BMS_SEMITONES = {"c": 0, "cp": 1, "d": 2, "dp": 3, "e": 4, "f": 5,
+                     "fp": 6, "g": 7, "gp": 8, "a": 9, "ap": 10, "b": 11}
+RE_MID2BMS_PURPLE_TAIL = re.compile(r'-o\d[a-g]p?$', re.IGNORECASE)
+RE_MID2BMS_HEAD = re.compile(r'^([brp]_.+)_v(\d+)(.*)$', re.IGNORECASE)
+RE_MID2BMS_LEN_FRAC = re.compile(r'^l(\d+)-(\d+)o(\d)([a-g]p?)$', re.IGNORECASE)
+RE_MID2BMS_LEN = re.compile(r'^l(\d+)o(\d)([a-g]p?)$', re.IGNORECASE)
+RE_MID2BMS_ONESHOT = re.compile(r'^o(\d)([a-g]p?)$', re.IGNORECASE)
+
+MIDI_PPQ = 960
+MIDI_TRACK_SUFFIX = " (MIDI)"
+# Keysounds that belong to no group still get a track, so no note is silently lost.
+MIDI_UNGROUPED_NAME = "ungrouped"
+
+
+def decode_mid2bms_stem(stem):
+    """Decode a Mid2BMS keysound file name.
+
+    Returns ``{"track", "vel", "den", "num", "pitch"}`` or ``None`` when the name
+    does not follow the convention. ``den``/``num`` are ``None`` for a one-shot.
+    """
+    if not stem:
+        return None
+    text = RE_MID2BMS_PURPLE_TAIL.sub('', stem)
+    match = RE_MID2BMS_HEAD.match(text)
+    if not match:
+        return None
+    head, vel_text, rest = match.groups()
+
+    frac = RE_MID2BMS_LEN_FRAC.match(rest)
+    if frac:
+        den, num, octave_text, note = int(frac.group(1)), int(frac.group(2)), frac.group(3), frac.group(4).lower()
+    else:
+        plain = RE_MID2BMS_LEN.match(rest)
+        if plain:
+            den, num, octave_text, note = int(plain.group(1)), 1, plain.group(2), plain.group(3).lower()
+        else:
+            one_shot = RE_MID2BMS_ONESHOT.match(rest)
+            if not one_shot:
+                return None
+            den, num, octave_text, note = None, None, one_shot.group(1), one_shot.group(2).lower()
+
+    if note not in MID2BMS_SEMITONES:
+        return None
+    return {
+        "track": head[2:],
+        "vel": max(1, min(127, int(vel_text))),
+        "den": den,
+        "num": num,
+        "pitch": max(0, min(127, int(octave_text) * 12 + MID2BMS_SEMITONES[note])),
+    }
+
+
+def midi_capability(wav_id_to_path):
+    """How much of this chart can be turned into MIDI.
+
+    ``pitched``  names that decode at all (pitch is known)
+    ``timed``    names that also carry a note length, i.e. the ones that actually
+                 become MIDI notes (one-shots are skipped)
+    """
+    stats = {"total": len(wav_id_to_path), "pitched": 0, "timed": 0, "oneshot": 0}
+    for wav_path in wav_id_to_path.values():
+        stem = Path(str(wav_path)).stem
+        decoded = decode_mid2bms_stem(stem)
+        if not decoded:
+            continue
+        stats["pitched"] += 1
+        if decoded["den"]:
+            stats["timed"] += 1
+        else:
+            stats["oneshot"] += 1
+    stats["usable"] = stats["timed"] > 0
+    return stats
+
+
+def collect_midi_notes(wav_ids, sample_dict, wav_id_to_path):
+    """Turn the occurrences of the given keysounds into MIDI notes.
+
+    Returns ``[(qn, dur_qn, pitch, vel, pos_seconds, sec_per_qn)]`` sorted by
+    musical position. Long-note tails and same-position duplicates are skipped:
+    they do not retrigger the sound in the audio project either.
+    """
+    notes = []
+    for wav_id in wav_ids:
+        decoded = decode_mid2bms_stem(Path(str(wav_id_to_path.get(wav_id, ""))).stem)
+        if not decoded or not decoded["den"]:
+            continue
+        dur_qn = 4.0 * decoded["num"] / decoded["den"]
+        for sample in sample_dict.get(wav_id, []):
+            if sample.get("ln_tail") or sample["length"] <= 0:
+                continue
+            qn = sample.get("qn")
+            if qn is None:
+                continue
+            notes.append((qn, dur_qn, decoded["pitch"], decoded["vel"],
+                          sample["pos"], sample.get("sec_per_qn")))
+    notes.sort(key=lambda note: (note[0], note[2]))
+    return notes
+
+
+def midi_item_bounds(notes):
+    """Item position/length in seconds plus PPQ ticks relative to the item start."""
+    if not notes:
+        return None
+    q0 = notes[0][0]
+    position = min(note[4] for note in notes)
+    end = max(note[4] + note[1] * (note[5] or 0.0) for note in notes)
+    events = []
+    for qn, dur_qn, pitch, vel, _pos, _spq in notes:
+        start_tick = int(round((qn - q0) * MIDI_PPQ))
+        end_tick = start_tick + max(1, int(round(dur_qn * MIDI_PPQ)))
+        events.append((start_tick, 1, 0x90, pitch, vel))
+        events.append((end_tick, 0, 0x80, pitch, 0))
+    events.sort(key=lambda event: (event[0], event[1]))
+    return position, max(end - position, 1.0 / 960.0), events
+
+
+def midi_event_lines(events, ppq=MIDI_PPQ):
+    """Render note events as REAPER ``E <delta> <status> <d1> <d2>`` lines."""
+    lines = []
+    last_tick = 0
+    for tick, _order, status, data1, data2 in events:
+        lines.append("E %d %02x %02x %02x" % (tick - last_tick, status, data1, data2 & 0x7F))
+        last_tick = tick
+    # all-notes-off one beat after the last event
+    lines.append("E %d b0 7b 00" % ppq)
+    return lines
+
+
+def write_midi_item(rpp_out, position, length, name, events, indent=""):
+    rpp_out.write(indent + "<ITEM\n")
+    rpp_out.write(indent + "POSITION {}\n".format(position))
+    rpp_out.write(indent + "LENGTH {}\n".format(length))
+    rpp_out.write(indent + "LOOP 1\n")
+    rpp_out.write(indent + 'NAME "{}"\n'.format(name))
+    rpp_out.write(indent + "<SOURCE MIDI\n")
+    rpp_out.write(indent + "HASDATA 1 {} QN\n".format(MIDI_PPQ))
+    rpp_out.write(indent + "CCINTERP 32\n")
+    for line in midi_event_lines(events):
+        rpp_out.write(indent + line + "\n")
+    rpp_out.write(indent + ">\n")
+    rpp_out.write(indent + ">\n")
+
+
+def build_smf(tracks, bpm, ppq=MIDI_PPQ):
+    """Standard MIDI File, type 1: a tempo track plus one track per group.
+
+    ``tracks`` is ``[(name, [(qn, dur_qn, pitch, vel)])]``.
+    """
+    def varlen(value):
+        buffer = [value & 0x7F]
+        value >>= 7
+        while value:
+            buffer.append((value & 0x7F) | 0x80)
+            value >>= 7
+        return bytes(reversed(buffer))
+
+    def track_chunk(events):
+        body = bytearray()
+        for delta, payload in events:
+            body += varlen(delta)
+            body += payload
+        return b"MTrk" + len(body).to_bytes(4, "big") + bytes(body)
+
+    # tempo track
+    tempo = int(round(60_000_000 / max(bpm, 1.0)))
+    conductor = [
+        (0, b"\xff\x51\x03" + tempo.to_bytes(3, "big")),
+        (0, b"\xff\x58\x04\x04\x02\x18\x08"),   # 4/4
+        (0, b"\xff\x2f\x00"),
+    ]
+    chunks = [track_chunk(conductor)]
+
+    for name, notes in tracks:
+        events = []
+        name_bytes = name.encode("utf-8")[:127]
+        events.append((0, b"\xff\x03" + varlen(len(name_bytes)) + name_bytes))
+        raw = []
+        for qn, dur_qn, pitch, vel in notes:
+            start = int(round(qn * ppq))
+            end = start + max(1, int(round(dur_qn * ppq)))
+            raw.append((start, 1, bytes([0x90, pitch & 0x7F, vel & 0x7F])))
+            raw.append((end, 0, bytes([0x80, pitch & 0x7F, 0x00])))
+        raw.sort(key=lambda item: (item[0], item[1]))
+        last = 0
+        for tick, _order, payload in raw:
+            events.append((tick - last, payload))
+            last = tick
+        events.append((0, b"\xff\x2f\x00"))
+        chunks.append(track_chunk(events))
+
+    header = b"MThd" + (6).to_bytes(4, "big") + (1).to_bytes(2, "big") \
+             + len(chunks).to_bytes(2, "big") + ppq.to_bytes(2, "big")
+    return header + b"".join(chunks)
+
+
 def compute_bms_timeline(bms_lines, wav_id_to_path):
     MPS_FACTOR = 240.0
 
@@ -840,6 +1079,10 @@ def compute_bms_timeline(bms_lines, wav_id_to_path):
     channelsample_dict = {}
     current_timepos = 0.0
     current_bpmpos_i = 0
+    # Musical position of the current measure start, in quarter notes. MIDI needs
+    # this; deriving it from seconds would be wrong across #STOP (waiting time is
+    # in the timeline but not in musical time) and would need a tempo-map inverse.
+    qn_at_measure = 0.0
 
     def measure_offset_seconds(start_measure, beatpos, bpmpos_array, stop_positions, measure_len):
         bpmpos = bpmpos_array[0]
@@ -877,7 +1120,7 @@ def compute_bms_timeline(bms_lines, wav_id_to_path):
         current_time += (beatpos - bpmpos) * MPS_FACTOR * measure_len / bpm
         return current_time
 
-    def add_keysounds_to_sample_dict(channel, keysounds, keysound_lengths_arg, current_timepos_arg, current_bpmpos_i_arg, stop_positions_arg, measure_num_arg, measure_len_arg):
+    def add_keysounds_to_sample_dict(channel, keysounds, keysound_lengths_arg, current_timepos_arg, current_bpmpos_i_arg, stop_positions_arg, measure_num_arg, measure_len_arg, qn_base_arg, sec_per_qn_arg):
         keysounds_len = len(keysounds)
         for k in range(len(keysounds)):
             keysound = keysounds[k]
@@ -889,6 +1132,8 @@ def compute_bms_timeline(bms_lines, wav_id_to_path):
                 sample = {}
                 sample["length"] = keysound_lengths_arg[keysound]
                 sample["pos"] = current_timepos_arg + measure_offset_seconds(measure_num_arg, measure_num_arg + k / keysounds_len, bpm_positions[current_bpmpos_i_arg:], stop_positions_arg, measure_len_arg)
+                sample["qn"] = qn_base_arg + (k / keysounds_len) * 4.0 * measure_len_arg
+                sample["sec_per_qn"] = sec_per_qn_arg
                 sample["index"] = keysound
                 sample_dict[keysound].append(sample)
                 channelsample_dict[channel].append(sample)
@@ -953,16 +1198,19 @@ def compute_bms_timeline(bms_lines, wav_id_to_path):
         for channel in BMS_PLAYABLE_CHANNELS:
             header = f"{measure_num:03d}{channel}"
             if header in notes_dict:
+                bpm_here = bpm_dict.get(bpm_positions[current_bpmpos_i], chart_bpm)
+                sec_per_qn = (60.0 / bpm_here) if bpm_here else (60.0 / 120.0)
                 if channel == "01":
                     for keysounds in notes_dict[header]:
-                        add_keysounds_to_sample_dict(channel, keysounds, keysound_lengths, current_timepos, current_bpmpos_i, stop_positions, measure_num, measure_len)
+                        add_keysounds_to_sample_dict(channel, keysounds, keysound_lengths, current_timepos, current_bpmpos_i, stop_positions, measure_num, measure_len, qn_at_measure, sec_per_qn)
                 else:
                     keysounds = notes_dict[header]
-                    add_keysounds_to_sample_dict(channel, keysounds, keysound_lengths, current_timepos, current_bpmpos_i, stop_positions, measure_num, measure_len)
+                    add_keysounds_to_sample_dict(channel, keysounds, keysound_lengths, current_timepos, current_bpmpos_i, stop_positions, measure_num, measure_len, qn_at_measure, sec_per_qn)
 
         current_timepos += measure_offset_seconds(
             measure_num, measure_num + 1, bpm_positions[current_bpmpos_i:], stop_positions, measure_len
         )
+        qn_at_measure += 4.0 * measure_len
 
         if measure_num + 1 in measurelen_dict:
             measurelentime_dict[measure_num + 1] = current_timepos
@@ -1040,6 +1288,8 @@ class BMSController:
         self.encoding = 'utf-8'
         self.last_length_warnings = []
         self.auto_group_stats = {}
+        self.midi_capability = {"total": 0, "pitched": 0, "timed": 0, "oneshot": 0, "usable": False}
+        self.last_midi_stats = {"tracks": 0, "notes": 0}
 
     def load_bms_file(self, file_path_str):
         self.file_path = Path(file_path_str)
@@ -1073,6 +1323,7 @@ class BMSController:
             # Every keysound is named after its two-character index: there is no
             # family information to group by, so leave everything pending.
             self.refresh_auto_group_stats()
+            self.refresh_midi_capability()
             return
 
         try:
@@ -1098,6 +1349,17 @@ class BMSController:
             pass
 
         self.refresh_auto_group_stats()
+        self.refresh_midi_capability()
+
+    def refresh_midi_capability(self):
+        """Decide whether this chart can produce MIDI at all.
+
+        Mid2BMS-style names carry the pitch; charts that name their keysounds
+        some other way (``kick.wav``, ``01.ogg`` ...) cannot be turned into MIDI,
+        and the UI must say so instead of silently producing empty tracks.
+        """
+        self.midi_capability = midi_capability(self.group_manager.original_wav_map if self.group_manager else {})
+        return self.midi_capability
 
     def refresh_auto_group_stats(self):
         """Record how well the automatic grouping did, for the UI/CLI to report."""
@@ -1121,12 +1383,13 @@ class BMSController:
     def export_sub_bms_files(self):
         return self.generate_group_bms_files()
 
-    def generate_rpp_file(self):
+    def generate_rpp_file(self, with_midi=False):
         if not self.file_path:
             raise ValueError("No BMS file loaded; cannot export RPP")
 
         sample_dict, chart_bpm, tempoenv_lines, master_volume, length_warnings = compute_bms_timeline(self.bms_lines, self.group_manager.original_wav_map)
         self.last_length_warnings = length_warnings
+        self.last_midi_stats = {"tracks": 0, "notes": 0}
         for warning in length_warnings:
             if sys.stderr is not None:
                 try:
@@ -1161,18 +1424,37 @@ class BMSController:
                         rpp_out.write("POSITION {}\n".format(sample["pos"]))
                         rpp_out.write("LENGTH {}\n".format(sample["length"]))
                         rpp_out.write("LOOP 0\n")
-                        rpp_out.write("NAME {}\n".format(wav_fullname))
+                        rpp_out.write('NAME "{}"\n'.format(wav_fullname))
                         if wav_ext == '.wav':
                             rpp_out.write("<SOURCE WAVE\n")
                         elif wav_ext == '.ogg':
                             rpp_out.write("<SOURCE VORBIS\n")
                         elif wav_ext == '.mp3':
                             rpp_out.write("<SOURCE MP3\n")
+                        elif wav_ext == '.flac':
+                            rpp_out.write("<SOURCE FLAC\n")
                         else:
                             rpp_out.write("<SOURCE\n")
                         rpp_out.write('FILE "{}"\n'.format(wav_path))
                         rpp_out.write(">\n")
                         rpp_out.write(">\n")
+
+            def write_midi_track(track_name, wav_ids):
+                """A parallel track after the folder, holding one MIDI item."""
+                notes = collect_midi_notes(wav_ids, sample_dict, self.group_manager.original_wav_map)
+                bounds = midi_item_bounds(notes)
+                if not bounds:
+                    return False
+                position, length, events = bounds
+                rpp_out.write('<TRACK\n')
+                rpp_out.write('NAME "{}"\n'.format(track_name))
+                rpp_out.write("VOLPAN 1 0 -1 -1 1\n")
+                rpp_out.write("ISBUS 0 0\n")
+                write_midi_item(rpp_out, position, length, track_name, events)
+                rpp_out.write(">\n")
+                self.last_midi_stats["tracks"] += 1
+                self.last_midi_stats["notes"] += len(notes)
+                return True
 
             if self.group_manager and self.group_manager.groups:
                 for group_name, group_data in self.group_manager.groups.items():
@@ -1201,6 +1483,9 @@ class BMSController:
 
                         rpp_out.write(">\n")
 
+                    if with_midi:
+                        write_midi_track("{}{}".format(group_name, MIDI_TRACK_SUFFIX), wav_ids_in_group)
+
             if self.group_manager:
                 for wav_id in self.wav_id_order:
                     if wav_id in self.group_manager.remaining_wav_map and wav_id in sample_dict:
@@ -1213,12 +1498,247 @@ class BMSController:
                         write_samples_for_index(wav_id, wav_path)
                         rpp_out.write(">\n")
 
+                # Ungrouped keysounds also carry notes; one track keeps them, so a
+                # note is never silently dropped from the MIDI side.
+                if with_midi:
+                    remaining_ids = [wid for wid in self.wav_id_order
+                                     if wid in self.group_manager.remaining_wav_map]
+                    if remaining_ids:
+                        write_midi_track("{}{}".format(MIDI_UNGROUPED_NAME, MIDI_TRACK_SUFFIX), remaining_ids)
+
             rpp_out.write(">\n")
 
         return str(out_rpp_path)
 
     def export_rpp_file(self):
         return self.generate_rpp_file()
+
+
+# ------------------------- BMS -> RPP/JSON writer: .mid output -------------------------
+
+def generate_midi_file(controller, out_path=None):
+    """Write one Standard MIDI File for the whole chart (type 1, one track per group).
+
+    This is the deliverable for people who never open REAPER: the same notes the
+    MIDI tracks would contain, in a file any DAW can import.
+    """
+    if not controller or not controller.group_manager:
+        raise ValueError("No BMS file loaded")
+    sample_dict, chart_bpm, _tempoenv, _master, _warnings = compute_bms_timeline(
+        controller.bms_lines, controller.group_manager.original_wav_map)
+    tracks = []
+    for group_name, group_data in controller.group_manager.groups.items():
+        notes = collect_midi_notes(list(group_data.keys()), sample_dict,
+                                   controller.group_manager.original_wav_map)
+        if notes:
+            tracks.append((group_name, [(qn, dur, pitch, vel) for qn, dur, pitch, vel, _p, _s in notes]))
+    # keysounds that ended up in no group still carry notes; keep them in one track
+    remaining = list(controller.group_manager.remaining_wav_map.keys())
+    leftover = collect_midi_notes(remaining, sample_dict, controller.group_manager.original_wav_map)
+    if leftover:
+        tracks.append((MIDI_UNGROUPED_NAME, [(qn, dur, pitch, vel) for qn, dur, pitch, vel, _p, _s in leftover]))
+    if not tracks:
+        raise ValueError("No keysound in this chart can be converted to MIDI")
+
+    if out_path is None:
+        out_path = controller.file_path.with_suffix('.mid')
+    payload = build_smf(tracks, chart_bpm)
+    with open(out_path, "wb") as handle:
+        handle.write(payload)
+    controller.last_midi_stats = {
+        "tracks": len(tracks),
+        "notes": sum(len(notes) for _name, notes in tracks),
+    }
+    return str(out_path)
+
+
+# ---- post-processing an existing .rpp (the "B" path, no REAPER needed) ----
+
+def _rpp_tempo_map(lines):
+    """Return [(seconds, bpm)] from the project tempo envelope, sorted."""
+    points = []
+    top_tempo = None
+    for line in lines[:12]:
+        text = line.strip()
+        if text.startswith("TEMPO "):
+            try:
+                top_tempo = float(text.split()[1])
+            except (IndexError, ValueError):
+                pass
+    for line in lines:
+        text = line.strip()
+        if not text.startswith("PT "):
+            continue
+        parts = text.split()
+        # PT <time> <bpm> <shape>  -- time signature points have bpm == 0
+        if len(parts) >= 3:
+            try:
+                time_value = float(parts[1])
+                bpm_value = float(parts[2])
+            except ValueError:
+                continue
+            if bpm_value > 0:
+                points.append((time_value, bpm_value))
+    if not points:
+        points = [(0.0, top_tempo or 120.0)]
+    points.sort()
+    if points[0][0] > 0:
+        points.insert(0, (0.0, points[0][1]))
+    return points
+
+
+def _time_to_qn(seconds, tempo_points):
+    """Convert project seconds to quarter notes through the piecewise tempo map."""
+    qn = 0.0
+    for index, (start, bpm) in enumerate(tempo_points):
+        end = tempo_points[index + 1][0] if index + 1 < len(tempo_points) else None
+        if end is None or seconds <= end:
+            return qn + (seconds - start) * bpm / 60.0
+        qn += (end - start) * bpm / 60.0
+    return qn
+
+
+def _rpp_parse_tracks(lines):
+    """Top-level TRACK blocks with their name, folder flags and items."""
+    tracks = []
+    depth = 0
+    current = None
+    item = None
+    for index, raw in enumerate(lines):
+        text = raw.strip()
+        if depth == 1 and text.startswith("<TRACK"):
+            current = {"name": "", "isbus": (0, 0), "items": []}
+            depth += 1
+            continue
+        if text.startswith("<"):
+            depth += 1
+            if current is not None and text.startswith("<ITEM") and depth == 3:
+                item = {"name": "", "pos": 0.0, "length": 0.0}
+            continue
+        if text == ">":
+            depth -= 1
+            if item is not None and depth == 2:
+                current["items"].append(item)
+                item = None
+            if current is not None and depth == 1:
+                tracks.append(current)
+                current = None
+            continue
+        if current is None:
+            continue
+        if depth == 2:
+            if text.startswith("NAME "):
+                value = text[5:]
+                if value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+                current["name"] = value
+            elif text.startswith("ISBUS "):
+                parts = text.split()
+                current["isbus"] = (int(parts[1]), int(parts[2]))
+        elif item is not None and depth == 3:
+            if text.startswith("POSITION "):
+                item["pos"] = float(text.split()[1])
+            elif text.startswith("LENGTH "):
+                item["length"] = float(text.split()[1])
+            elif text.startswith("NAME ") and not item["name"]:
+                value = text[5:]
+                if value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+                item["name"] = value
+    return tracks
+
+
+def add_midi_tracks_to_rpp(rpp_path, out_path=None, suffix=MIDI_TRACK_SUFFIX):
+    """Insert one ``<folder name> (MIDI)`` track after every folder of an .rpp.
+
+    Same result as running bmsrpp2midi inside REAPER, but offline. Returns
+    ``{"tracks": n, "notes": n, "folders": n}``.
+    """
+    rpp_path = Path(rpp_path)
+    lines = rpp_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    tempo_points = _rpp_tempo_map(lines)
+    tracks = _rpp_parse_tracks(lines)
+    if not tracks:
+        raise ValueError("No track found in {}".format(rpp_path.name))
+
+    # folder spans (a folder starts at I_FOLDERDEPTH > 0 and ends when depth returns to 0)
+    spans = []
+    depth = 0
+    open_at = None
+    for index, track in enumerate(tracks):
+        if track["isbus"][0] > 0 and depth == 0:
+            open_at = index
+        depth += track["isbus"][1]
+        if open_at is not None and depth <= 0:
+            spans.append((open_at, index))
+            open_at = None
+            depth = 0
+
+    # line index of each track's closing '>' so the new track can be inserted after it
+    close_line = []
+    depth = 0
+    for index, raw in enumerate(lines):
+        text = raw.strip()
+        if depth == 1 and text.startswith("<TRACK"):
+            depth += 1
+            close_line.append(None)
+            continue
+        if text.startswith("<"):
+            depth += 1
+        elif text == ">":
+            depth -= 1
+            if depth == 1 and close_line and close_line[-1] is None:
+                close_line[-1] = index
+
+    new_tracks = {}
+    stats = {"tracks": 0, "notes": 0, "folders": len(spans)}
+    for first, last in spans:
+        group_name = tracks[first]["name"] or "Folder"
+        notes = []
+        for track in tracks[first + 1:last + 1]:
+            for item in track["items"]:
+                decoded = decode_mid2bms_stem(Path(item["name"]).stem)
+                if not decoded or not decoded["den"]:
+                    continue
+                dur_qn = 4.0 * decoded["num"] / decoded["den"]
+                qn = _time_to_qn(item["pos"], tempo_points)
+                notes.append((qn, dur_qn, decoded["pitch"], decoded["vel"]))
+        if not notes:
+            continue
+        notes.sort(key=lambda note: (note[0], note[2]))
+        q0 = notes[0][0]
+        q1 = max(note[0] + note[1] for note in notes)
+        sec_per_qn = 60.0 / tempo_points[0][1]
+        events = []
+        for qn, dur_qn, pitch, vel in notes:
+            start = int(round((qn - q0) * MIDI_PPQ))
+            end = start + max(1, int(round(dur_qn * MIDI_PPQ)))
+            events.append((start, 1, 0x90, pitch, vel))
+            events.append((end, 0, 0x80, pitch, 0))
+        events.sort(key=lambda event: (event[0], event[1]))
+        position = q0 * sec_per_qn
+        length = max((q1 - q0) * sec_per_qn, 1.0 / 960.0)
+        name = "{}{}".format(group_name, suffix)
+        block = ['<TRACK', 'NAME "{}"'.format(name), "VOLPAN 1 0 -1 -1 1", "ISBUS 0 0"]
+        buffer = io.StringIO()
+        write_midi_item(buffer, position, length, name, events)
+        block.extend(buffer.getvalue().rstrip("\n").split("\n"))
+        block.append(">")
+        new_tracks[close_line[last]] = block
+        stats["tracks"] += 1
+        stats["notes"] += len(notes)
+
+    out_lines = []
+    for index, raw in enumerate(lines):
+        out_lines.append(raw)
+        if index in new_tracks:
+            out_lines.extend(new_tracks[index])
+
+    if out_path is None:
+        out_path = rpp_path.with_name(rpp_path.stem + "_midi.rpp")
+    Path(out_path).write_text("\n".join(out_lines) + "\n", encoding="utf-8", newline="\n")
+    stats["out"] = str(out_path)
+    return stats
 
 
 # ------------------------- View (GUI) layer -------------------------
@@ -1247,11 +1767,16 @@ class BMSDivGUI:
     def _setup_ui(self):
         file_frame = tk.Frame(self.root)
         file_frame.grid(row=0, column=0, columnspan=3, padx=10, pady=5, sticky="ew")
-        tk.Button(file_frame, text=gettext("select_file"), command=self._on_select_file_clicked).pack(side="left")
+        self.button_select_file = tk.Button(file_frame, text=gettext("select_file"), command=self._on_select_file_clicked)
+        self.button_select_file.pack(side="left")
         self.label_file_info = tk.Label(file_frame, text=gettext("not_selected"))
         self.label_file_info.pack(side="left", padx=10)
-        self.label_bpm_info = tk.Label(file_frame, text="")
-        self.label_bpm_info.pack(side="right", padx=10)
+
+        # group-config I/O lives here, on the right, instead of in the bottom row
+        self.button_export_json = tk.Button(file_frame, text=gettext("export_json"), command=self._on_export_json_clicked)
+        self.button_export_json.pack(side="right", padx=(5, 0))
+        self.button_import_json = tk.Button(file_frame, text=gettext("import_json"), command=self._on_import_json_clicked)
+        self.button_import_json.pack(side="right", padx=5)
 
         main_container = tk.Frame(self.root)
         main_container.grid(row=1, column=0, columnspan=3, padx=10, pady=5, sticky="nsew")
@@ -1267,8 +1792,10 @@ class BMSDivGUI:
         self.entry_search.pack(side="left", fill="x", expand=True, ipady=2)
         self.entry_search.bind("<Return>", lambda e: self._handle_grouping_action())
 
-        tk.Button(search_box_frame, text=gettext("search_group"), command=self._handle_grouping_action, bg="#e1e1e1").pack(side="left", padx=(2, 0))
-        tk.Button(search_box_frame, text=gettext("group_remaining"), command=self._handle_group_remaining_action, bg="#e1e1e1").pack(side="left", padx=(2, 0))
+        self.button_search_group = tk.Button(search_box_frame, text=gettext("search_group"), command=self._handle_grouping_action, bg="#e1e1e1")
+        self.button_search_group.pack(side="left", padx=(2, 0))
+        self.button_group_remaining = tk.Button(search_box_frame, text=gettext("group_remaining"), command=self._handle_group_remaining_action, bg="#e1e1e1")
+        self.button_group_remaining.pack(side="left", padx=(2, 0))
 
         self.listbox_remaining = tk.Listbox(wav_frame, width=50, height=20, selectmode="extended", exportselection=False)
         self.listbox_remaining.pack(side="left", fill="both", expand=True)
@@ -1295,10 +1822,59 @@ class BMSDivGUI:
         self.label_status = tk.Label(bottom_frame, text=gettext("ready"))
         self.label_status.pack(side="right", padx=5)
 
-        tk.Button(bottom_frame, text=gettext("export_bms"), command=self._on_export_bms_clicked).pack(side="left", padx=5)
-        tk.Button(bottom_frame, text=gettext("export_rpp"), command=self._on_export_rpp_clicked).pack(side="left", padx=5)
-        tk.Button(bottom_frame, text=gettext("export_json"), command=self._on_export_json_clicked).pack(side="left", padx=5)
-        tk.Button(bottom_frame, text=gettext("import_json"), command=self._on_import_json_clicked).pack(side="left", padx=5)
+        self.button_export_bms = tk.Button(bottom_frame, text=gettext("export_bms"), command=self._on_export_bms_clicked)
+        self.button_export_bms.pack(side="left", padx=5)
+        self.button_export_rpp = tk.Button(bottom_frame, text=gettext("export_rpp"), command=self._on_export_rpp_clicked)
+        self.button_export_rpp.pack(side="left", padx=5)
+
+        self.var_with_midi = tk.BooleanVar(value=True)
+        self.check_with_midi = tk.Checkbutton(
+            bottom_frame, text=gettext("export_rpp_with_midi"),
+            variable=self.var_with_midi, command=self._on_with_midi_toggled)
+        self.check_with_midi.pack(side="left", padx=(0, 5))
+
+        self.button_export_midi = tk.Button(
+            bottom_frame, text=gettext("export_midi"), command=self._on_export_midi_clicked)
+        self.button_export_midi.pack(side="left", padx=5)
+
+        # Everything below the file picker is meaningless until a chart is loaded.
+        self.file_dependent_widgets = [
+            self.entry_search,
+            self.button_search_group,
+            self.button_group_remaining,
+            self.listbox_remaining,
+            self.tree_groups,
+            self.listbox_group_detail,
+            self.button_export_bms,
+            self.button_export_rpp,
+            self.button_export_midi,
+            self.check_with_midi,
+            self.button_export_json,
+            self.button_import_json,
+        ]
+        self._set_loaded_state(False)
+
+    @staticmethod
+    def _set_widget_enabled(widget, enabled):
+        try:
+            if isinstance(widget, ttk.Widget):
+                widget.state(["!disabled"] if enabled else ["disabled"])
+            else:
+                widget.config(state="normal" if enabled else "disabled")
+        except tk.TclError:
+            pass
+
+    def _set_loaded_state(self, loaded):
+        """Only the file picker stays usable while no chart is loaded."""
+        for widget in self.file_dependent_widgets:
+            self._set_widget_enabled(widget, loaded)
+        if loaded:
+            self._update_midi_controls()
+        else:
+            self._set_widget_enabled(self.check_with_midi, False)
+            self._set_widget_enabled(self.button_export_midi, False)
+            self.check_with_midi.config(text=gettext("export_rpp_with_midi"))
+            self.var_with_midi.set(False)
 
     def _setup_event_bindings(self):
         self.root.bind("<Control-z>", lambda e: self._perform_undo())
@@ -1348,20 +1924,16 @@ class BMSDivGUI:
                             pass
 
             self.label_file_info.config(text=str(self.controller.file_path), fg="black")
-            if self.controller.initial_bpm and self.controller.initial_bpm.strip():
-                self.label_bpm_info.config(text=gettext("initial_bpm").format(self.controller.initial_bpm.strip()))
-            else:
-                self.label_bpm_info.config(text="")
             self._ui_refresh_all()
-            status = f"{gettext('load_success')} (编码: {self.controller.encoding})"
+            status = f"{gettext('load_success')} ({self.controller.encoding})"
             stats = getattr(self.controller, "auto_group_stats", None)
             if stats and stats.get("groups"):
-                status += " · " + gettext("auto_group_stats").format(
-                    stats["groups"], stats["grouped"], stats["total"], stats["largest"])
+                status += " · " + gettext("auto_group_stats_short").format(stats["groups"], stats["largest"])
             self.label_status.config(text=status)
+            self._set_loaded_state(True)
         except Exception as e:
             self.label_file_info.config(text=gettext("load_failed"), fg="red")
-            self.label_bpm_info.config(text="")
+            self._set_loaded_state(False)
             messagebox.showerror(gettext("file_error"), str(e))
 
     def _play_sound(self, path):
@@ -1751,18 +2323,17 @@ class BMSDivGUI:
 
     def _on_export_rpp_clicked(self):
         if not self.controller.group_manager or not self.controller.group_manager.groups:
+            messagebox.showinfo(gettext("title"), gettext("export_needs_groups"))
             return
         try:
             self.label_status.config(text=gettext("loading_timeline"))
             self.root.update()
-            rpp_path = self.controller.generate_rpp_file()
+            with_midi = bool(self.var_with_midi.get()) and self._midi_available()
+            rpp_path = self.controller.generate_rpp_file(with_midi=with_midi)
             skipped = len(getattr(self.controller, "last_length_warnings", []) or [])
+            self.label_status.config(text=gettext("rpp_export_done").format(Path(rpp_path).name))
             if skipped:
-                message = gettext("length_skipped").format(skipped)
-                self.label_status.config(text=f"{gettext('rpp_export_done').format(Path(rpp_path).name)} / {message}")
-                messagebox.showwarning(gettext("title"), message)
-            else:
-                self.label_status.config(text=gettext("rpp_export_done").format(Path(rpp_path).name))
+                messagebox.showwarning(gettext("title"), gettext("length_skipped").format(skipped))
             try:
                 os.startfile(self.controller.directory)
             except Exception:
@@ -1770,6 +2341,48 @@ class BMSDivGUI:
         except Exception as exc:
             messagebox.showerror(gettext("rpp_fail"), str(exc))
             self.label_status.config(text=gettext("rpp_fail"))
+
+    def _midi_available(self):
+        return bool(getattr(self.controller, "midi_capability", {}).get("usable"))
+
+    def _on_with_midi_toggled(self):
+        self._midi_user_touched = True
+        if self.var_with_midi.get() and not self._midi_available():
+            self.var_with_midi.set(False)
+
+    def _update_midi_controls(self):
+        """Enable the MIDI controls only when the chart actually carries MIDI data.
+
+        A chart whose keysounds are not named Mid2BMS-style has no pitch
+        information at all, so both controls are disabled, the checkbox is forced
+        off and its label says so -- better than producing empty MIDI tracks.
+        """
+        usable = self._midi_available()
+        self._set_widget_enabled(self.check_with_midi, usable)
+        self._set_widget_enabled(self.button_export_midi, usable)
+        if usable:
+            if not getattr(self, "_midi_user_touched", False):
+                self.var_with_midi.set(True)     # default on
+        else:
+            self.var_with_midi.set(False)
+
+    def _on_export_midi_clicked(self):
+        if not self.controller.group_manager or not self.controller.file_path:
+            return
+        if not self._midi_available():
+            return
+        try:
+            self.label_status.config(text=gettext("loading_timeline"))
+            self.root.update()
+            midi_path = generate_midi_file(self.controller)
+            self.label_status.config(text=gettext("midi_export_done").format(Path(midi_path).name))
+            try:
+                os.startfile(self.controller.directory)
+            except Exception:
+                pass
+        except Exception as exc:
+            messagebox.showerror(gettext("midi_fail"), str(exc))
+            self.label_status.config(text=gettext("midi_fail"))
 
     def _on_export_json_clicked(self):
         if not self.controller.group_manager or not self.controller.file_path:
@@ -1813,9 +2426,14 @@ def build_cli_parser():
     parser.add_argument(
         "-o",
         "--output",
-        choices=("bms", "rpp"),
+        choices=("bms", "rpp", "mid"),
         help="Export format. Results are written next to the source BMS file in the same directory.",
     )
+    parser.add_argument("--midi", action="store_true",
+                        help="With -o rpp: also write one MIDI track per group (Mid2BMS names only).")
+    parser.add_argument("--rpp2midi", metavar="RPP",
+                        help="Add MIDI tracks to an existing .rpp (offline replacement for bmsrpp2midi.lua).")
+    parser.add_argument("--out", metavar="PATH", help="Output path for --rpp2midi.")
     parser.add_argument("--lang", choices=("zh", "ja", "en"), default=os.getenv("BMS_DIV_LANG", detect_system_language()), help="Language for CLI/help text")
     parser.add_argument("--version", action="version", version="BMS_div")
     return parser
@@ -1825,6 +2443,12 @@ def run_cli(argv=None):
     parser = build_cli_parser()
     args = parser.parse_args(argv)
     set_language(args.lang)
+
+    if args.rpp2midi:
+        stats = add_midi_tracks_to_rpp(args.rpp2midi, args.out)
+        print("Folders: {folders}, MIDI tracks: {tracks}, notes: {notes}".format(**stats))
+        print(f"Written: {stats['out']}")
+        return 0
 
     if not args.bms:
         if args.json or args.output:
@@ -1838,6 +2462,12 @@ def run_cli(argv=None):
 
     controller = BMSController()
     controller.load_bms_file(str(bms_path))
+    capability = controller.midi_capability
+    midi_usable = bool(capability.get("usable"))
+    if capability.get("pitched"):
+        print("MIDI: {timed} of {total} keysounds convertible ({oneshot} one-shot skipped)".format(**capability))
+    else:
+        print("MIDI: no Mid2BMS-style keysound name in this chart")
 
     if args.json:
         json_path = Path(args.json)
@@ -1858,8 +2488,23 @@ def run_cli(argv=None):
     if args.output == "rpp":
         if not controller.group_manager or not controller.group_manager.groups:
             raise SystemExit("No groups were available for RPP export.")
-        rpp_path = controller.generate_rpp_file()
+        with_midi = bool(args.midi) and midi_usable
+        if args.midi and not midi_usable:
+            print("WARNING: --midi ignored, this chart has no convertible keysound")
+        rpp_path = controller.generate_rpp_file(with_midi=with_midi)
         print(f"Generated RPP: {rpp_path}")
+        if with_midi:
+            stats = controller.last_midi_stats
+            print("MIDI tracks: {tracks}, notes: {notes}".format(**stats))
+        return 0
+
+    if args.output == "mid":
+        if not midi_usable:
+            raise SystemExit("No keysound in this chart can be converted to MIDI.")
+        midi_path = generate_midi_file(controller, args.out)
+        stats = controller.last_midi_stats
+        print(f"Generated MIDI: {midi_path}")
+        print("MIDI tracks: {tracks}, notes: {notes}".format(**stats))
         return 0
 
     print(f"Loaded BMS: {controller.file_path}")
