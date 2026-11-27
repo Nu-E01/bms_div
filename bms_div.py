@@ -6,9 +6,12 @@ import math
 import sys
 import locale
 import argparse
+import tempfile
 import tkinter as tk
+import xml.etree.ElementTree as ET
 from tkinter import filedialog, messagebox, ttk, simpledialog
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 
 LANGUAGES = {
@@ -40,13 +43,17 @@ LANGUAGES = {
         "group_remaining": "剩余分一组",
         "export_bms": "导出BMS",
         "export_rpp": "导出RPP",
+        "export_dawproject": "导出 DAWproject",
         "export_json": "导出分组配置",
         "import_json": "导入分组配置",
         "file_error": "文件错误",
         "rpp_fail": "RPP 导出失败",
+        "dawproject_fail": "DAWproject 导出失败",
         "group_import_fail": "分组导入失败",
         "bms_export_done": "BMS 导出完毕",
         "rpp_export_done": "RPP 导出完毕：{}",
+        "dawproject_export_done": "DAWproject 导出完毕：{}",
+        "dawproject_audio_skipped": "已跳过 {} 个缺失或无法读取的音源",
         "length_skipped": "{} 个音源无法读取真实时长，已跳过",
         "group_export_ok": "分组导出成功",
         "group_import_ok": "导入完成：共 {} 个分组",
@@ -98,6 +105,8 @@ LANGUAGES = {
         "group_remaining": "残りの音源をまとめてグループ化",
         "export_bms": "BMSを出力",
         "export_rpp": "RPPを出力",
+        "export_dawproject": "DAWproject を出力",
+        "dawproject_fail": "DAWproject の出力に失敗しました",
         "export_json": "グループ設定を出力",
         "import_json": "グループ設定を読み込み",
         "file_error": "ファイルエラー",
@@ -105,6 +114,8 @@ LANGUAGES = {
         "group_import_fail": "グループ設定の読み込みに失敗しました",
         "bms_export_done": "BMSの出力が完了しました",
         "rpp_export_done": "RPPの出力が完了しました：{}",
+        "dawproject_export_done": "DAWproject の出力が完了しました：{}",
+        "dawproject_audio_skipped": "見つからない、または読み込めない音源を {} 件スキップしました",
         "length_skipped": "{} 件の音源の長さを取得できず、スキップしました",
         "group_export_ok": "グループ設定の出力に成功しました",
         "group_import_ok": "読み込み完了：グループ数 {}",
@@ -156,13 +167,17 @@ LANGUAGES = {
         "group_remaining": "Group remaining sounds together",
         "export_bms": "Export BMS",
         "export_rpp": "Export RPP",
+        "export_dawproject": "Export DAWproject",
         "export_json": "Export group config",
         "import_json": "Import group config",
         "file_error": "File error",
         "rpp_fail": "RPP export failed",
+        "dawproject_fail": "DAWproject export failed",
         "group_import_fail": "Group config import failed",
         "bms_export_done": "BMS export complete",
         "rpp_export_done": "RPP export complete: {}",
+        "dawproject_export_done": "DAWproject export complete: {}",
+        "dawproject_audio_skipped": "Skipped {} missing or unreadable audio source(s)",
         "length_skipped": "Skipped {} sound(s) whose real length could not be read",
         "group_export_ok": "Group config export successful",
         "group_import_ok": "Import complete: {} groups",
@@ -628,8 +643,8 @@ def _update_data(old_data, new_data):
     return merged_data
 
 
-def _probe_riff_wave_length(file_obj):
-    """Read the true duration out of a RIFF/RF64 WAVE header.
+def _probe_riff_wave_info(file_obj):
+    """Read the duration, sample rate, and channels from a RIFF/RF64 WAVE header.
 
     The stdlib ``wave`` module refuses 24-bit / 32-bit float /
     WAVE_FORMAT_EXTENSIBLE files, which this header walk handles, and it falls
@@ -645,6 +660,7 @@ def _probe_riff_wave_length(file_obj):
     order = "big" if header[:4] == b"RIFX" else "little"
 
     sample_rate = 0
+    channels = 0
     block_align = 0
     data_size = None
     pos = 12
@@ -677,11 +693,11 @@ def _probe_riff_wave_length(file_obj):
     frames = data_size // block_align
     if frames <= 0:
         return None
-    return frames / float(sample_rate)
+    return frames / float(sample_rate), sample_rate, channels
 
 
-def probe_audio_length(audio_path):
-    """Return ``(duration_seconds, source)`` for an audio file, or ``(None, None)``.
+def probe_audio_info(audio_path):
+    """Return ``((duration_seconds, sample_rate, channels), source)`` if readable.
 
     Attempts, in order of accuracy:
       1. RIFF/WAVE header walk - exact, and covers 24-bit / EXTENSIBLE / float
@@ -695,18 +711,19 @@ def probe_audio_length(audio_path):
     """
     try:
         with open(audio_path, "rb") as file_obj:
-            duration = _probe_riff_wave_length(file_obj)
-        if duration and duration > 0:
-            return duration, "riff"
+            info = _probe_riff_wave_info(file_obj)
+        if info:
+            return info, "riff"
     except Exception:
         pass
 
     try:
         import mutagen
         audio = mutagen.File(audio_path)
-        duration = getattr(getattr(audio, "info", None), "length", None)
+        info = getattr(audio, "info", None)
+        duration = getattr(info, "length", None)
         if duration and duration > 0:
-            return float(duration), "mutagen"
+            return (float(duration), getattr(info, "sample_rate", None), getattr(info, "channels", None)), "mutagen"
     except Exception:
         pass
 
@@ -714,11 +731,17 @@ def probe_audio_length(audio_path):
         from pydub import AudioSegment
         segment = AudioSegment.from_file(audio_path)
         if segment.frame_rate:
-            return segment.frame_count() / float(segment.frame_rate), "pydub"
+            duration = segment.frame_count() / float(segment.frame_rate)
+            return (duration, segment.frame_rate, segment.channels), "pydub"
     except Exception:
         pass
 
     return None, None
+
+
+def probe_audio_length(audio_path):
+    info, source = probe_audio_info(audio_path)
+    return (info[0], source) if info else (None, None)
 
 
 def _same_sound_key(wav_path):
@@ -970,7 +993,7 @@ def build_smf(tracks, bpm, ppq=MIDI_PPQ):
     return header + b"".join(chunks)
 
 
-def compute_bms_timeline(bms_lines, wav_id_to_path):
+def _compute_bms_timeline(bms_lines, wav_id_to_path, *, source_audio=None):
     MPS_FACTOR = 240.0
 
     BMS_PLAYABLE_CHANNELS = (
@@ -1069,7 +1092,16 @@ def compute_bms_timeline(bms_lines, wav_id_to_path):
         if not wav_path or not Path(wav_path).is_file():
             length_warnings.append(f"{wav_id}: {wav_path} (文件不存在)")
             continue
-        duration, _source = probe_audio_length(wav_path)
+        if source_audio is None:
+            duration, _source = probe_audio_length(wav_path)
+        else:
+            info, _source = probe_audio_info(wav_path)
+            duration = info[0] if info else None
+            if duration and not all(info[1:]):
+                length_warnings.append(f"{wav_id}: {wav_path} (无法读取采样率或声道数)")
+                continue
+            if duration:
+                source_audio[wav_id] = info
         if not duration:
             length_warnings.append(f"{wav_id}: {wav_path} (无法读取音频时长)")
             continue
@@ -1248,11 +1280,11 @@ def compute_bms_timeline(bms_lines, wav_id_to_path):
     # Truncation priority: same sound replay > the audio's own true length.
     apply_same_sound_trim(sample_dict, wav_id_to_path)
 
-    tempoenv_lines = []
+    tempo_events = []
     if bpm_positions or len(measurelentime_dict) > 1:
         for bpm_pos in bpm_positions:
             if bpm_pos in bpmtime_dict:
-                tempoenv_lines.append(f'    PT {bpmtime_dict[bpm_pos]} {bpm_dict[bpm_pos]} 1\n')
+                tempo_events.append((bpmtime_dict[bpm_pos], bpm_dict[bpm_pos], None))
         for measurelen_pos in sorted(measurelentime_dict.keys()):
             measurelentime = measurelentime_dict[measurelen_pos]
             measurelen = measurelen_dict.get(measurelen_pos, 1.0)
@@ -1262,7 +1294,22 @@ def compute_bms_timeline(bms_lines, wav_id_to_path):
                 ts_num = int(ts_num * den4_factor)
                 ts_den = int(ts_den * den4_factor)
             if ts_num <= 256 and ts_den <= 256:
-                tempoenv_lines.append(f'    PT {measurelentime} 0 1 {ts_den * 65536 + ts_num} 0 3\n')
+                tempo_events.append((measurelentime, 0, (ts_num, ts_den)))
+
+    return sample_dict, chart_bpm, tempo_events, master_volume, length_warnings
+
+
+def compute_bms_timeline(bms_lines, wav_id_to_path):
+    sample_dict, chart_bpm, tempo_events, master_volume, length_warnings = _compute_bms_timeline(
+        bms_lines, wav_id_to_path
+    )
+    tempoenv_lines = []
+    for time, bpm, signature in tempo_events:
+        if signature is None:
+            tempoenv_lines.append(f'    PT {time} {bpm} 1\n')
+        else:
+            numerator, denominator = signature
+            tempoenv_lines.append(f'    PT {time} 0 1 {denominator * 65536 + numerator} 0 3\n')
 
     return sample_dict, chart_bpm, tempoenv_lines, master_volume, length_warnings
 
@@ -1512,6 +1559,110 @@ class BMSController:
 
     def export_rpp_file(self):
         return self.generate_rpp_file()
+
+    def generate_dawproject_file(self, out_path=None):
+        if not self.file_path:
+            raise ValueError("No BMS file loaded; cannot export DAWproject")
+
+        out_path = Path(out_path) if out_path else self.file_path.with_suffix(".dawproject")
+        if out_path.suffix.lower() != ".dawproject":
+            raise ValueError("The output filename must end in .dawproject")
+
+        groups = self.group_manager
+        source_audio = {}
+        samples, chart_bpm, tempo_events, master_volume, warnings = _compute_bms_timeline(
+            self.bms_lines, groups.original_wav_map, source_audio=source_audio
+        )
+        self.last_length_warnings = warnings
+
+        tempo_points = {0.0: chart_bpm}
+        signature_points = {0.0: (4, 4)}
+        for time, bpm, signature in tempo_events:
+            if signature is None:
+                tempo_points[time] = bpm
+            else:
+                signature_points[time] = signature
+
+        project = ET.Element("Project", version="1.0")
+        ET.SubElement(project, "Application", name="BMS_div", version="1.0")
+        transport = ET.SubElement(project, "Transport")
+        ET.SubElement(transport, "Tempo", id="tempo", unit="bpm", value=str(tempo_points[0.0]))
+        numerator, denominator = signature_points[0.0]
+        ET.SubElement(transport, "TimeSignature", id="signature", numerator=str(numerator), denominator=str(denominator))
+        structure = ET.SubElement(project, "Structure")
+        arrangement = ET.SubElement(project, "Arrangement")
+        # Keep sample positions in seconds so BMS stops and clip lengths survive tempo changes.
+        lanes = ET.SubElement(arrangement, "Lanes", timeUnit="seconds")
+
+        if len(tempo_points) > 1:
+            automation = ET.SubElement(arrangement, "TempoAutomation", timeUnit="seconds", unit="bpm")
+            ET.SubElement(automation, "Target", parameter="tempo")
+            for time, bpm in sorted(tempo_points.items()):
+                ET.SubElement(automation, "RealPoint", time=str(time), value=str(bpm), interpolation="hold")
+
+        if len(signature_points) > 1:
+            automation = ET.SubElement(arrangement, "TimeSignatureAutomation", timeUnit="seconds")
+            ET.SubElement(automation, "Target", parameter="signature")
+            for time, (numerator, denominator) in sorted(signature_points.items()):
+                ET.SubElement(automation, "TimeSignaturePoint", time=str(time), numerator=str(numerator), denominator=str(denominator))
+
+        media_paths = {}
+
+        def add_track(parent, track_id, name, content_type, role, destination=None, volume=1):
+            track = ET.SubElement(parent, "Track", id=track_id, name=name, contentType=content_type, loaded="true")
+            channel = ET.SubElement(track, "Channel", id=f"{track_id}_channel", audioChannels="2", role=role)
+            if destination:
+                channel.set("destination", destination)
+            ET.SubElement(channel, "Mute", value="false")
+            ET.SubElement(channel, "Pan", unit="normalized", min="0", max="1", value="0.5")
+            ET.SubElement(channel, "Volume", unit="linear", min="0", max=str(max(2, volume)), value=str(volume))
+            return track
+
+        def add_keysound_track(parent, wav_id, wav_path, destination):
+            occurrences = [sample for sample in samples.get(wav_id, ()) if sample["length"] > 0]
+            if not occurrences:
+                return
+
+            path = Path(wav_path)
+            media_key = _same_sound_key(path)
+            if media_key not in media_paths:
+                media_paths[media_key] = (path, f"audio/{len(media_paths) + 1:04d}{path.suffix.lower()}")
+            _, archive_path = media_paths[media_key]
+            duration, sample_rate, channels = source_audio[wav_id]
+
+            track_id = f"sound_{destination}_{wav_id}"
+            add_track(parent, track_id, path.stem, "audio", "regular", destination)
+            track_lanes = ET.SubElement(lanes, "Lanes", track=track_id, timeUnit="seconds")
+            clips = ET.SubElement(track_lanes, "Clips", timeUnit="seconds")
+            for sample in sorted(occurrences, key=lambda sample: sample["pos"]):
+                clip = ET.SubElement(clips, "Clip", name=path.name, time=str(sample["pos"]),
+                                     duration=str(sample["length"]), contentTimeUnit="seconds", playStart="0")
+                audio = ET.SubElement(clip, "Audio", timeUnit="seconds", duration=str(duration),
+                                      sampleRate=str(sample_rate), channels=str(channels))
+                ET.SubElement(audio, "File", path=archive_path)
+
+        for index, (group_name, group_data) in enumerate(groups.groups.items(), start=1):
+            group_id = f"group_{index}"
+            group_track = add_track(structure, group_id, group_name, "tracks", "submix", "master_channel")
+            for wav_id, wav_path in group_data.items():
+                add_keysound_track(group_track, wav_id, wav_path, f"{group_id}_channel")
+
+        for wav_id, wav_path in groups.remaining_wav_map.items():
+            add_keysound_track(structure, wav_id, wav_path, "master_channel")
+        add_track(structure, "master", "Master", "audio", "master", volume=master_volume / 300.0)
+
+        metadata = ET.Element("MetaData")
+        ET.SubElement(metadata, "Title").text = self.file_path.stem
+        with tempfile.TemporaryDirectory(dir=out_path.parent) as temporary_dir:
+            archive_path = Path(temporary_dir) / out_path.name
+            with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as archive:
+                archive.writestr("project.xml", ET.tostring(project, encoding="utf-8", xml_declaration=True))
+                archive.writestr("metadata.xml", ET.tostring(metadata, encoding="utf-8", xml_declaration=True))
+                for path, entry_name in media_paths.values():
+                    archive.write(path, entry_name)
+            archive_path.replace(out_path)
+
+        return str(out_path)
 
 
 # ------------------------- BMS -> RPP/JSON writer: .mid output -------------------------
@@ -1833,6 +1984,10 @@ class BMSDivGUI:
             variable=self.var_with_midi, command=self._on_with_midi_toggled)
         self.check_with_midi.pack(side="left", padx=(0, 5))
 
+        self.button_export_dawproject = tk.Button(
+            bottom_frame, text=gettext("export_dawproject"), command=self._on_export_dawproject_clicked)
+        self.button_export_dawproject.pack(side="left", padx=5)
+
         self.button_export_midi = tk.Button(
             bottom_frame, text=gettext("export_midi"), command=self._on_export_midi_clicked)
         self.button_export_midi.pack(side="left", padx=5)
@@ -1847,6 +2002,7 @@ class BMSDivGUI:
             self.listbox_group_detail,
             self.button_export_bms,
             self.button_export_rpp,
+            self.button_export_dawproject,
             self.button_export_midi,
             self.check_with_midi,
             self.button_export_json,
@@ -2342,6 +2498,35 @@ class BMSDivGUI:
             messagebox.showerror(gettext("rpp_fail"), str(exc))
             self.label_status.config(text=gettext("rpp_fail"))
 
+    def _on_export_dawproject_clicked(self):
+        source = self.controller.file_path
+        if not source:
+            return
+        out_path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title=gettext("export_dawproject"),
+            defaultextension=".dawproject",
+            initialdir=str(source.parent),
+            initialfile=source.with_suffix(".dawproject").name,
+            filetypes=[("DAWproject", "*.dawproject")],
+        )
+        if not out_path:
+            return
+
+        self.label_status.config(text=gettext("loading_timeline"))
+        self.root.update_idletasks()
+        try:
+            exported = self.controller.generate_dawproject_file(out_path)
+        except (OSError, ValueError) as exc:
+            self.label_status.config(text=gettext("dawproject_fail"))
+            messagebox.showerror(gettext("dawproject_fail"), str(exc), parent=self.root)
+            return
+
+        self.label_status.config(text=gettext("dawproject_export_done").format(Path(exported).name))
+        skipped = len(self.controller.last_length_warnings)
+        if skipped:
+            messagebox.showwarning(gettext("title"), gettext("dawproject_audio_skipped").format(skipped), parent=self.root)
+
     def _midi_available(self):
         return bool(getattr(self.controller, "midi_capability", {}).get("usable"))
 
@@ -2418,7 +2603,7 @@ class BMSDivGUI:
 
 def build_cli_parser():
     parser = argparse.ArgumentParser(
-        description="BMS_div: export grouped BMS files or RPP projects from a BMS chart directory.",
+        description="BMS_div: export grouped BMS files, RPP or DAWproject projects, and MIDI from BMS charts.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("bms", nargs="?", help="Input .bms file")
@@ -2426,14 +2611,14 @@ def build_cli_parser():
     parser.add_argument(
         "-o",
         "--output",
-        choices=("bms", "rpp", "mid"),
+        choices=("bms", "rpp", "dawproject", "mid"),
         help="Export format. Results are written next to the source BMS file in the same directory.",
     )
     parser.add_argument("--midi", action="store_true",
                         help="With -o rpp: also write one MIDI track per group (Mid2BMS names only).")
     parser.add_argument("--rpp2midi", metavar="RPP",
                         help="Add MIDI tracks to an existing .rpp (offline replacement for bmsrpp2midi.lua).")
-    parser.add_argument("--out", metavar="PATH", help="Output path for --rpp2midi.")
+    parser.add_argument("--out", metavar="PATH", help="Output path for DAWproject, MIDI, or --rpp2midi.")
     parser.add_argument("--lang", choices=("zh", "ja", "en"), default=os.getenv("BMS_DIV_LANG", detect_system_language()), help="Language for CLI/help text")
     parser.add_argument("--version", action="version", version="BMS_div")
     return parser
@@ -2505,6 +2690,16 @@ def run_cli(argv=None):
         stats = controller.last_midi_stats
         print(f"Generated MIDI: {midi_path}")
         print("MIDI tracks: {tracks}, notes: {notes}".format(**stats))
+        return 0
+
+    if args.output == "dawproject":
+        try:
+            dawproject_path = controller.generate_dawproject_file(args.out)
+        except (OSError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        print(f"Generated DAWproject: {dawproject_path}")
+        for warning in controller.last_length_warnings:
+            print(f"[BMS_div] {warning}", file=sys.stderr)
         return 0
 
     print(f"Loaded BMS: {controller.file_path}")

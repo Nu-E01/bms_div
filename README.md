@@ -8,13 +8,13 @@
 
 # BMS_div
 
-BMS_div is a lightweight tool for organizing BMS charts. Users can group notes by keysound name, either automatically or manually, and export the grouped BMS files or REAPER projects.
+BMS_div is a lightweight tool for organizing BMS charts. Users can group notes by keysound name and export grouped BMS files, REAPER projects, or DAWproject files.
 
 ## 简体中文
 
 ### 项目简介
 
-BMS_div 是一款用于整理 BMS 谱面的轻量工具，可根据按键音名称对 note 进行自动分组，并导出已分组的 BMS 文件或 REAPER 工程。
+BMS_div 是一款用于整理 BMS 谱面的轻量工具，可根据键音名称自动分组，并导出分组 BMS、REAPER 工程或 DAWproject 工程。
 
 ### 主要功能
 
@@ -22,6 +22,7 @@ BMS_div 是一款用于整理 BMS 谱面的轻量工具，可根据按键音名�
 - 在 GUI 中手动管理分组
 - 导出分组后的 BMS 文件
 - 导出 REAPER `.rpp` 工程
+- 点击「导出 DAWproject」保存 `.dawproject`，保留分组和键音时间轴，并将音频打包进工程文件
 - 导出 / 导入分组配置为 JSON
 - 由 Mid2BMS 命名的键音还原 MIDI：RPP 可附带 MIDI 轨，也可单独导出 `.mid`
 - 通过语言切换支持简体中文、日文和英文
@@ -31,6 +32,7 @@ BMS_div 是一款用于整理 BMS 谱面的轻量工具，可根据按键音名�
 - Python 3.9+
 - tkinter
 - 可选依赖：pygame, chardet
+- Mutagen 用于读取 OGG、MP3 等压缩音源的信息
 
 ### 安装
 
@@ -82,6 +84,14 @@ python bms_div.py path/to/chart.bms path/to/groups.json -o rpp --midi
 ```
 
 每个分组后面会多出一条 `<组名> (MIDI)` 并列轨，内含一个 MIDI item。
+
+#### 导出 `.dawproject`
+
+```bash
+python bms_div.py path/to/chart.bms -o dawproject --out path/to/project.dawproject
+```
+
+可以在 BMS 路径后加上分组 JSON。省略 `--out` 时，工程保存到 BMS 文件所在目录。
 
 #### 单独导出 `.mid`
 
@@ -141,6 +151,7 @@ BMS_div は、BMS 譜面を整理するための軽量ツールです。ユー�
 - キーワード検索や自動ロジックで残りの音源をまとめて分組
 - 分組済み BMS を出力
 - REAPER の `.rpp` を出力
+- 「DAWproject を出力」で、グループとキー音の配置を保持し、音声を含む `.dawproject` ファイルを保存
 - 分組設定を JSON でインポート / エクスポート
 - 中文 / 日本語 / English の三言語切り替えに対応
 
@@ -150,6 +161,7 @@ BMS_div は、BMS 譜面を整理するための軽量ツールです。ユー�
 - tkinter
 - 任意依存: pygame
 - 任意依存: chardet
+- OGG や MP3 などの音声情報の取得に Mutagen を使用
 
 ### インストール
 
@@ -193,6 +205,14 @@ python bms_div.py path/to/chart.bms path/to/groups.json -o bms
 ```bash
 python bms_div.py path/to/chart.bms path/to/groups.json -o rpp
 ```
+
+#### `.dawproject` を出力
+
+```bash
+python bms_div.py path/to/chart.bms -o dawproject --out path/to/project.dawproject
+```
+
+BMS のパスの後にグループ設定 JSON を指定できます。`--out` を省略すると BMS と同じフォルダーに保存します。
 
 #### RPP に MIDI トラックも含める
 
@@ -250,7 +270,7 @@ python bms_div.py --version
 
 ### Project overview
 
-BMS_div is a lightweight tool for organizing BMS charts. Users can group notes by keysound name, either automatically or manually, and export the grouped BMS files or REAPER projects.
+BMS_div is a lightweight tool for organizing BMS charts. Users can group notes by keysound name and export grouped BMS files, REAPER projects, or DAWproject files.
 
 ### Features
 
@@ -259,6 +279,7 @@ BMS_div is a lightweight tool for organizing BMS charts. Users can group notes b
 - Use keyword search or built-in automatic logic to group remaining sounds
 - Export grouped BMS files
 - Export REAPER `.rpp` project files
+- Use **Export DAWproject** to save groups and keysound placement in a `.dawproject` file with embedded audio
 - Import and export group configuration as JSON
 - Rebuild MIDI from Mid2BMS keysound names: optional MIDI tracks in the RPP, or a standalone `.mid`
 - Support Chinese, Japanese, and English via built-in language switching
@@ -269,6 +290,7 @@ BMS_div is a lightweight tool for organizing BMS charts. Users can group notes b
 - tkinter
 - optional: pygame
 - optional: chardet
+- Mutagen is used to read audio metadata for compressed keysounds such as OGG and MP3
 
 ### Installation
 
@@ -312,6 +334,14 @@ python bms_div.py path/to/chart.bms path/to/groups.json -o bms
 ```bash
 python bms_div.py path/to/chart.bms path/to/groups.json -o rpp
 ```
+
+#### Export `.dawproject`
+
+```bash
+python bms_div.py path/to/chart.bms -o dawproject --out path/to/project.dawproject
+```
+
+You can pass a group configuration JSON after the BMS path. Omit `--out` to save the project next to the BMS source.
 
 #### Export RPP with MIDI tracks
 
